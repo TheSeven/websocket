@@ -262,6 +262,10 @@ func newConn(conn net.Conn, readBufferSize, writeBufferSize int) *Conn {
 	return newConnBRW(conn, readBufferSize, writeBufferSize, nil)
 }
 
+func (c *Conn) HasCompressionSupport() bool {
+	return c.newCompressionWriter != nil
+}
+
 type writeHook struct {
 	p []byte
 }
