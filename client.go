@@ -339,7 +339,7 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 		}
 	}
 
-	conn := newConn(netConn, false, d.ReadBufferSize, d.WriteBufferSize)
+	conn := newConn(netConn, d.ReadBufferSize, d.WriteBufferSize)
 
 	if err := req.Write(netConn); err != nil {
 		return nil, nil, err

@@ -171,7 +171,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		return nil, errors.New("websocket: client sent data before handshake is complete")
 	}
 
-	c := newConnBRW(netConn, true, u.ReadBufferSize, u.WriteBufferSize, brw)
+	c := newConnBRW(netConn, u.ReadBufferSize, u.WriteBufferSize, brw)
 	c.subprotocol = subprotocol
 
 	if compress {

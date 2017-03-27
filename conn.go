@@ -10,7 +10,6 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
-	"math/rand"
 	"net"
 	"strconv"
 	"sync"
@@ -181,11 +180,6 @@ var (
 	errInvalidControlFrame = errors.New("websocket: invalid control frame")
 )
 
-func newMaskKey() [4]byte {
-	n := rand.Uint32()
-	return [4]byte{byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
-}
-
 func hideTempErr(err error) error {
 	if e, ok := err.(net.Error); ok && e.Temporary() {
 		err = &netError{msg: e.Error(), timeout: e.Timeout()}
@@ -227,7 +221,7 @@ func isValidReceivedCloseCode(code int) bool {
 // The Conn type represents a WebSocket connection.
 type Conn struct {
 	conn        net.Conn
-	isServer    bool
+	isMasked    bool
 	subprotocol string
 
 	// Write fields
@@ -264,8 +258,8 @@ type Conn struct {
 	newDecompressionReader func(io.Reader) io.ReadCloser
 }
 
-func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int) *Conn {
-	return newConnBRW(conn, isServer, readBufferSize, writeBufferSize, nil)
+func newConn(conn net.Conn, readBufferSize, writeBufferSize int) *Conn {
+	return newConnBRW(conn, readBufferSize, writeBufferSize, nil)
 }
 
 type writeHook struct {
@@ -277,7 +271,7 @@ func (wh *writeHook) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func newConnBRW(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, brw *bufio.ReadWriter) *Conn {
+func newConnBRW(conn net.Conn, readBufferSize, writeBufferSize int, brw *bufio.ReadWriter) *Conn {
 	mu := make(chan bool, 1)
 	mu <- true
 
@@ -323,7 +317,6 @@ func newConnBRW(conn net.Conn, isServer bool, readBufferSize, writeBufferSize in
 	}
 
 	c := &Conn{
-		isServer:               isServer,
 		br:                     br,
 		conn:                   conn,
 		mu:                     mu,
@@ -409,21 +402,11 @@ func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) er
 
 	b0 := byte(messageType) | finalBit
 	b1 := byte(len(data))
-	if !c.isServer {
-		b1 |= maskBit
-	}
 
 	buf := make([]byte, 0, maxFrameHeaderSize+maxControlFramePayloadSize)
 	buf = append(buf, b0, b1)
 
-	if c.isServer {
-		buf = append(buf, data...)
-	} else {
-		key := newMaskKey()
-		buf = append(buf, key[:]...)
-		buf = append(buf, data...)
-		maskBytes(key, 0, buf[6:])
-	}
+	buf = append(buf, data...)
 
 	d := time.Hour * 1000
 	if !deadline.IsZero() {
@@ -541,16 +524,9 @@ func (w *messageWriter) flushFrame(final bool, extra []byte) error {
 	w.compress = false
 
 	b1 := byte(0)
-	if !c.isServer {
-		b1 |= maskBit
-	}
 
 	// Assume that the frame starts at beginning of c.writeBuf.
-	framePos := 0
-	if c.isServer {
-		// Adjust up if mask not included in the header.
-		framePos = 4
-	}
+	framePos := 4
 
 	switch {
 	case length >= 65536:
@@ -566,15 +542,6 @@ func (w *messageWriter) flushFrame(final bool, extra []byte) error {
 		framePos += 8
 		c.writeBuf[framePos] = b0
 		c.writeBuf[framePos+1] = b1 | byte(length)
-	}
-
-	if !c.isServer {
-		key := newMaskKey()
-		copy(c.writeBuf[maxFrameHeaderSize-4:], key[:])
-		maskBytes(key, 0, c.writeBuf[maxFrameHeaderSize:w.pos])
-		if len(extra) > 0 {
-			return c.writeFatal(errors.New("websocket: internal error, extra used in client mode"))
-		}
 	}
 
 	// Write the buffers to the connection with best-effort detection of
@@ -627,7 +594,7 @@ func (w *messageWriter) Write(p []byte) (int, error) {
 		return 0, w.err
 	}
 
-	if len(p) > 2*len(w.c.writeBuf) && w.c.isServer {
+	if len(p) > 2 * len(w.c.writeBuf) {
 		// Don't buffer large messages.
 		err := w.flushFrame(false, p)
 		if err != nil {
@@ -706,7 +673,6 @@ func (w *messageWriter) Close() error {
 // WritePreparedMessage writes prepared message into connection.
 func (c *Conn) WritePreparedMessage(pm *PreparedMessage) error {
 	frameType, frameData, err := pm.frame(prepareKey{
-		isServer:         c.isServer,
 		compress:         c.newCompressionWriter != nil && c.enableWriteCompression && isData(pm.messageType),
 		compressionLevel: c.compressionLevel,
 	})
@@ -729,7 +695,7 @@ func (c *Conn) WritePreparedMessage(pm *PreparedMessage) error {
 // writing the message and closing the writer.
 func (c *Conn) WriteMessage(messageType int, data []byte) error {
 
-	if c.isServer && (c.newCompressionWriter == nil || !c.enableWriteCompression) {
+	if (c.newCompressionWriter == nil || !c.enableWriteCompression) {
 		// Fast path with no allocations and single frame.
 
 		if err := c.prepWrite(messageType); err != nil {
@@ -836,10 +802,7 @@ func (c *Conn) advanceFrame() (int, error) {
 
 	// 4. Handle frame masking.
 
-	if mask != c.isServer {
-		return noFrame, c.handleProtocolError("incorrect mask flag")
-	}
-
+	c.isMasked = mask
 	if mask {
 		c.readMaskPos = 0
 		p, err := c.read(len(c.readMaskKey))
@@ -871,7 +834,7 @@ func (c *Conn) advanceFrame() (int, error) {
 		if err != nil {
 			return noFrame, err
 		}
-		if c.isServer {
+		if mask {
 			maskBytes(c.readMaskKey, 0, payload)
 		}
 	}
@@ -977,7 +940,7 @@ func (r *messageReader) Read(b []byte) (int, error) {
 			}
 			n, err := c.br.Read(b)
 			c.readErr = hideTempErr(err)
-			if c.isServer {
+			if c.isMasked {
 				c.readMaskPos = maskBytes(c.readMaskKey, c.readMaskPos, b[:n])
 			}
 			c.readRemaining -= int64(n)
